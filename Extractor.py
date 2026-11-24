@@ -16,9 +16,11 @@ class Extractor:
         ventana.withdraw()
         ventana.attributes("-topmost", True)
         try:
+            escritorio = Path.home() / "Desktop"
             ruta = filedialog.askopenfilename(
                 title="Selecciona el archivo CSV",
-                filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
+                initialdir=str(escritorio) if escritorio.is_dir() else str(Path.home()),
+                filetypes=[("Archivos CSV", "*.csv")],
             )
         finally:
             ventana.destroy()
