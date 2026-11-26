@@ -1,202 +1,77 @@
-import hashlib
-import json
+"""Persistencia relacional; las tablas etl_* antiguas no se modifican."""
 import os
-from collections.abc import Mapping, Sequence
-from typing import Any
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, event, select, func, and_
+from sqlalchemy.pool import NullPool
+import modelo as m
 
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    Integer,
-    JSON,
-    MetaData,
-    String,
-    Table,
-    UniqueConstraint,
-    create_engine,
-    insert,
-    select,
-    update,
-)
-
+def ahora():
+    return datetime.now(timezone.utc)
 
 class GestorPersistencia:
-    def __init__(self, conexion_db: str | None = None) -> None:
+    def __init__(self, conexion_db=None):
         self.db = conexion_db or os.getenv("DATABASE_URL", "sqlite:///opendata_etl.db")
-        self.engine = create_engine(self.db, future=True)
-        self.metadata = MetaData()
-        self.registros = Table(
-            "etl_registros",
-            self.metadata,
-            Column("id", Integer, primary_key=True),
-            Column("origen", String(1024), nullable=False),
-            Column("huella", String(64), nullable=False),
-            Column("datos", JSON, nullable=False),
-            UniqueConstraint("huella", name="uq_etl_registros_huella"),
-        )
-        self.ejecuciones = Table(
-            "etl_ejecuciones",
-            self.metadata,
-            Column("id", Integer, primary_key=True),
-            Column("inicio", DateTime(timezone=True), nullable=False),
-            Column("fin", DateTime(timezone=True), nullable=False),
-            Column("estado", String(32), nullable=False),
-            Column("origen", String(1024), nullable=True),
-            Column("duracion_segundos", Float, nullable=False),
-            Column("filas_procesadas", Integer, nullable=False),
-            Column("indicadores_calidad", JSON, nullable=False),
-            Column("errores", JSON, nullable=False),
-        )
-        self.fuentes = Table(
-            "etl_fuentes",
-            self.metadata,
-            Column("nombre", String(255), primary_key=True),
-            Column("procedencia", String(2048), nullable=False),
-            Column("licencia", String(512), nullable=False),
-            Column("formato", String(32), nullable=False),
-            Column("fecha_disponible", String(128), nullable=False),
-            Column("version", String(128), nullable=False),
-            Column("fecha_registro", DateTime(timezone=True), nullable=False),
-            Column("columnas", JSON, nullable=False),
-            Column("filas_disponibles", Integer, nullable=False),
-        )
+        opciones = {"poolclass": NullPool} if str(self.db).startswith("sqlite:") else {}
+        self.engine = create_engine(self.db, pool_pre_ping=True, **opciones)
+        if self.engine.dialect.name == "sqlite":
+            @event.listens_for(self.engine, "connect")
+            def foreign_keys(connection, _):
+                connection.execute("PRAGMA foreign_keys=ON")
+        self.metadata = m.metadata
         self.metadata.create_all(self.engine)
 
-    @staticmethod
-    def _huella(registro: Mapping[str, Any]) -> str:
-        contenido = json.dumps(
-            registro,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
-        return hashlib.sha256(contenido.encode("utf-8")).hexdigest()
-
-    def comprobar_duplicados(self, registros: Sequence[Mapping[str, Any]]) -> int:
-        huellas_vistas: set[str] = set()
-        duplicados = 0
-        huellas_unicas: list[str] = []
-        for registro in registros:
-            huella = self._huella(registro)
-            if huella in huellas_vistas:
-                duplicados += 1
-            else:
-                huellas_vistas.add(huella)
-                huellas_unicas.append(huella)
-
-        with self.engine.connect() as conexion:
-            for inicio in range(0, len(huellas_unicas), 500):
-                lote = huellas_unicas[inicio : inicio + 500]
-                existentes = set(
-                    conexion.execute(
-                        select(self.registros.c.huella).where(
-                            self.registros.c.huella.in_(lote)
-                        )
-                    ).scalars()
-                )
-                duplicados += len(existentes)
-        return duplicados
-
-    def almacenar_datos(
-        self,
-        datos_transformados: Sequence[Mapping[str, Any]],
-        origen: str,
-    ) -> int:
-        filas_insertadas = 0
-        huellas_procesadas: set[str] = set()
-
-        with self.engine.begin() as conexion:
-            for inicio in range(0, len(datos_transformados), 500):
-                lote = datos_transformados[inicio : inicio + 500]
-                valores = []
-                for registro in lote:
-                    huella = self._huella(registro)
-                    if huella in huellas_procesadas:
-                        continue
-                    huellas_procesadas.add(huella)
-                    valores.append(
-                        {
-                            "origen": origen,
-                            "huella": huella,
-                            "datos": dict(registro),
-                        }
-                    )
-
-                if not valores:
-                    continue
-                existentes = set(
-                    conexion.execute(
-                        select(self.registros.c.huella).where(
-                            self.registros.c.huella.in_(
-                                [valor["huella"] for valor in valores]
-                            )
-                        )
-                    ).scalars()
-                )
-                nuevos = [
-                    valor for valor in valores if valor["huella"] not in existentes
-                ]
-                if nuevos:
-                    conexion.execute(insert(self.registros), nuevos)
-                    filas_insertadas += len(nuevos)
-
-        return filas_insertadas
-
-    def guardar_ejecucion(self, ejecucion: Mapping[str, Any]) -> None:
-        with self.engine.begin() as conexion:
-            conexion.execute(insert(self.ejecuciones).values(**dict(ejecucion)))
-
-    def obtener_registros(
-        self,
-        origen: str | None = None,
-        limite: int = 10000,
-    ) -> list[dict[str, Any]]:
+    def listar(self, tabla, limite=500):
         if limite < 1:
-            raise ValueError("'limite' debe ser mayor que cero.")
+            raise ValueError("El límite debe ser positivo")
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(select(tabla).order_by(tabla.c.id.desc()).limit(limite)).mappings()]
 
-        consulta = select(self.registros).order_by(self.registros.c.id.desc()).limit(limite)
-        if origen is not None:
-            consulta = consulta.where(self.registros.c.origen == origen)
+    def obtener_fuentes(self, limite=500):
+        return self.listar(m.fuente, limite)
 
-        with self.engine.connect() as conexion:
-            return [dict(fila) for fila in conexion.execute(consulta).mappings()]
+    def obtener_ejecuciones(self, limite=500):
+        return self.listar(m.ejecucion, limite)
 
-    def obtener_ejecuciones(self, limite: int = 500) -> list[dict[str, Any]]:
+    def obtener_observaciones(self, origen=None, limite=10000, codigo_dpa=None, anio=None):
         if limite < 1:
-            raise ValueError("'limite' debe ser mayor que cero.")
+            raise ValueError("El límite debe ser positivo")
+        query = select(m.observacion.c.id, m.fuente.c.nombre.label("fuente"),
+            m.indicador.c.codigo.label("indicador"), m.indicador.c.unidad,
+            m.territorio.c.codigo_dpa, m.territorio.c.nombre.label("territorio"), m.territorio.c.nivel,
+            m.observacion.c.anio, m.observacion.c.valor, m.observacion.c.version_fuente_id,
+            m.observacion.c.ejecucion_id, m.version_fuente.c.fecha_actualizacion_fuente).select_from(
+                m.observacion.join(m.indicador).join(m.fuente, m.indicador.c.fuente_id == m.fuente.c.id)
+                .join(m.territorio, m.observacion.c.territorio_id == m.territorio.c.id)
+                .join(m.version_fuente, m.observacion.c.version_fuente_id == m.version_fuente.c.id))
+        if origen:
+            query = query.where(m.fuente.c.nombre == origen)
+        if codigo_dpa:
+            query = query.where(m.territorio.c.codigo_dpa == codigo_dpa)
+        if anio is not None:
+            query = query.where(m.observacion.c.anio == anio)
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(query.order_by(m.observacion.c.id.desc()).limit(limite)).mappings()]
 
-        consulta = (
-            select(self.ejecuciones)
-            .order_by(self.ejecuciones.c.id.desc())
-            .limit(limite)
-        )
-        with self.engine.connect() as conexion:
-            return [dict(fila) for fila in conexion.execute(consulta).mappings()]
+    obtener_registros = obtener_observaciones
 
-    def registrar_fuente(self, fuente: Mapping[str, Any]) -> None:
-        valores = dict(fuente)
-        nombre = valores.get("nombre")
-        if not isinstance(nombre, str) or not nombre.strip():
-            raise ValueError("La fuente debe tener un nombre.")
-
-        with self.engine.begin() as conexion:
-            existente = conexion.execute(
-                select(self.fuentes.c.nombre).where(self.fuentes.c.nombre == nombre)
-            ).first()
-            if existente:
-                conexion.execute(
-                    update(self.fuentes)
-                    .where(self.fuentes.c.nombre == nombre)
-                    .values(**{clave: valor for clave, valor in valores.items() if clave != "nombre"})
-                )
-            else:
-                conexion.execute(insert(self.fuentes).values(**valores))
-
-    def obtener_fuentes(self, limite: int = 500) -> list[dict[str, Any]]:
-        if limite < 1:
-            raise ValueError("'limite' debe ser mayor que cero.")
-        consulta = select(self.fuentes).order_by(self.fuentes.c.nombre).limit(limite)
-        with self.engine.connect() as conexion:
-            return [dict(fila) for fila in conexion.execute(consulta).mappings()]
+    def cruzar_indicadores(self, codigo_a, codigo_b, anio, limite=1000):
+        """Una versión por indicador/territorio/año: publicación, descarga, id."""
+        ranked = select(m.observacion.c.territorio_id, m.observacion.c.anio, m.observacion.c.valor,
+            m.observacion.c.version_fuente_id, m.indicador.c.codigo,
+            func.row_number().over(partition_by=(m.observacion.c.indicador_id,
+                m.observacion.c.territorio_id, m.observacion.c.anio), order_by=(
+                m.version_fuente.c.fecha_actualizacion_fuente.desc(),
+                m.version_fuente.c.fecha_descarga.desc(), m.version_fuente.c.id.desc())).label("pos")
+            ).select_from(m.observacion.join(m.indicador).join(m.version_fuente,
+                m.observacion.c.version_fuente_id == m.version_fuente.c.id)
+            ).where(m.observacion.c.anio == anio).subquery()
+        a, b = ranked.alias("a"), ranked.alias("b")
+        query = select(m.territorio.c.codigo_dpa, m.territorio.c.nombre.label("territorio"),
+            a.c.anio, a.c.valor.label("valor_a"), b.c.valor.label("valor_b"),
+            a.c.version_fuente_id.label("version_a"), b.c.version_fuente_id.label("version_b")
+            ).select_from(a.join(b, and_(a.c.territorio_id == b.c.territorio_id, a.c.anio == b.c.anio))
+            .join(m.territorio, a.c.territorio_id == m.territorio.c.id)
+            ).where(a.c.codigo == codigo_a, b.c.codigo == codigo_b, a.c.pos == 1, b.c.pos == 1
+            ).order_by(m.territorio.c.codigo_dpa).limit(limite)
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(query).mappings()]

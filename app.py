@@ -1,106 +1,13 @@
 import json
-from datetime import datetime, timezone
-from typing import Any
-
 import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
-
 from GestorPersistencia import GestorPersistencia
 from PipelineETL import PipelineETL
 
 
-def _json_value(valor: Any) -> Any:
-    if isinstance(valor, str):
-        try:
-            return json.loads(valor)
-        except json.JSONDecodeError:
-            return valor
-    return valor
-
-
-def _columnas_numericas(df: pd.DataFrame, columnas: list[str]) -> list[str]:
-    return [
-        columna
-        for columna in columnas
-        if pd.to_numeric(df[columna], errors="coerce").notna().any()
-    ]
-
-
-def _columnas_fecha(df: pd.DataFrame, columnas: list[str]) -> list[str]:
-    candidatas = [
-        columna
-        for columna in columnas
-        if any(termino in columna.lower() for termino in ("fecha", "date", "time"))
-    ]
-    return [
-        columna
-        for columna in candidatas
-        if pd.to_datetime(df[columna], errors="coerce").notna().any()
-    ]
-
-
-def _columna_disponible(base: str, columnas: list[str]) -> str:
-    nombre = base
-    sufijo = 2
-    while nombre in columnas:
-        nombre = f"{base}_{sufijo}"
-        sufijo += 1
-    return nombre
-
-
-def _leer_reglas() -> dict[str, Any]:
-    renombres = json.loads(st.session_state.get("reglas_renombres", "{}") or "{}")
-    tipos = json.loads(st.session_state.get("reglas_tipos", "{}") or "{}")
-    if not isinstance(renombres, dict) or not isinstance(tipos, dict):
-        raise ValueError("Los renombrados y tipos deben estar escritos como objetos JSON.")
-    requeridas = [
-        columna.strip()
-        for columna in st.session_state.get("reglas_requeridas", "").split(",")
-        if columna.strip()
-    ]
-    perfil = st.session_state.get("perfil_reglas", "Estándar: normalizar y quitar duplicados")
-    if perfil == "Completo: quitar nulos y duplicados":
-        eliminar_nulos, eliminar_duplicados = True, True
-    elif perfil == "Conservar todas las filas":
-        eliminar_nulos, eliminar_duplicados = False, False
-    elif perfil == "Personalizado":
-        eliminar_nulos = st.session_state.get("reglas_eliminar_nulos", False)
-        eliminar_duplicados = st.session_state.get("reglas_eliminar_duplicados", True)
-    else:
-        eliminar_nulos, eliminar_duplicados = False, True
-    return {
-        "renombrar_columnas": renombres,
-        "tipos": tipos,
-        "columnas_requeridas": requeridas,
-        "eliminar_nulos": eliminar_nulos,
-        "eliminar_duplicados": eliminar_duplicados,
-    }
-
-
-def _validar_metadatos(metadatos: dict[str, Any]) -> list[str]:
-    etiquetas = {
-        "nombre": "nombre de la fuente",
-        "procedencia": "procedencia o URL",
-        "licencia": "licencia",
-        "fecha_disponible": "fecha disponible",
-        "version": "versión",
-    }
-    return [
-        etiqueta
-        for campo, etiqueta in etiquetas.items()
-        if not str(metadatos.get(campo, "")).strip()
-    ]
-
-
-def _fecha_texto(valor: Any) -> str:
-    if isinstance(valor, datetime):
-        return valor.date().isoformat()
-    return str(valor or "")
-
-
 @st.cache_resource
-def _obtener_persistencia() -> GestorPersistencia:
+def _obtener_persistencia_relacional_v2() -> GestorPersistencia:
     return GestorPersistencia()
 
 
@@ -251,490 +158,150 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+import modelo as m
+from pathlib import Path
+
 try:
-    persistencia = _obtener_persistencia()
+    persistencia = _obtener_persistencia_relacional_v2()
     catalogo = persistencia.obtener_fuentes()
-    ejecuciones = persistencia.obtener_ejecuciones()
-    registros = persistencia.obtener_registros(limite=10000)
-except SQLAlchemyError as error:
-    st.error(f"No se pudo consultar la base de datos: {error}")
-    st.info("Configura `DATABASE_URL` para PostgreSQL o utiliza la base SQLite local.")
+except SQLAlchemyError:
+    st.error("No se pudo conectar a la base. Inicia el proyecto con local.py web.")
     st.stop()
 
-df_ejecuciones = pd.DataFrame(ejecuciones)
-df_registros = pd.DataFrame(registros)
-columna_fuente: str | None = None
-if not df_registros.empty:
-    datos_normalizados = pd.json_normalize(df_registros["datos"].map(_json_value))
-    datos_normalizados.columns = [str(columna) for columna in datos_normalizados.columns]
-    columna_fuente = _columna_disponible(
-        "__opendata_fuente_origen__",
-        list(datos_normalizados.columns),
-    )
-    df_registros = datos_normalizados.reset_index(drop=True)
-    df_registros.insert(
-        0,
-        columna_fuente,
-        pd.Series(registros).map(lambda registro: registro["origen"]).reset_index(drop=True),
-    )
+st.caption("Modelo relacional · fuentes, versiones, indicadores y territorios DPA")
+if "resultado_relacional" in st.session_state:
+    resultado = st.session_state.pop("resultado_relacional")
+    st.success(f"Carga completa: {resultado['filas_insertadas']} observaciones nuevas; "
+               f"{resultado['duplicados_omitidos']} duplicados omitidos. Ejecución {resultado['ejecucion_id']}.")
 
-if "fuentes_guardadas" in st.session_state:
-    st.session_state.pop("fuentes_guardadas")
-    st.success("Las fuentes quedaron registradas en el catálogo.")
-if "ultima_integracion" in st.session_state:
-    resultado_integracion = st.session_state.pop("ultima_integracion")
-    st.success(
-        "Integración completada: "
-        f"{resultado_integracion['filas_insertadas']:,} registros nuevos, "
-        f"{resultado_integracion['duplicados_omitidos']:,} duplicados omitidos."
-    )
-
-tab_flujo, tab_catalogo, tab_datos, tab_analisis, tab_monitoreo, tab_api = st.tabs(
-    [
-        "⬆️ Integrar fuentes",
-        "📚 Catálogo",
-        "🗂️ Datos",
-        "📊 Analítica",
-        "🛰️ Monitoreo",
-        "🔌 API",
-    ]
-)
-
-with tab_flujo:
-    st.subheader("Integrar dos fuentes públicas")
-    st.caption(
-        "Selecciona un CSV para cada fuente. El sistema compara los esquemas "
-        "normalizados y no permite integrar archivos incompatibles."
-    )
-    nombres_catalogo = [fuente["nombre"] for fuente in catalogo]
-    catalogo_por_nombre = {fuente["nombre"]: fuente for fuente in catalogo}
-    opcion_nueva = "＋ Registrar una fuente nueva"
-    fuentes_seleccionadas: list[dict[str, Any]] = []
-    columnas_fuentes = st.columns(2, gap="large")
-
-    for indice, contenedor in enumerate(columnas_fuentes):
-        sufijo = "a" if indice == 0 else "b"
-        titulo = "Fuente 01" if indice == 0 else "Fuente 02"
-        with contenedor:
-            st.markdown(f"#### {titulo}")
-            seleccion = st.selectbox(
-                "Fuente del catálogo",
-                [opcion_nueva, *nombres_catalogo],
-                key=f"fuente_catalogo_{sufijo}",
-            )
-            archivo = st.file_uploader(
-                "Archivo de datos (.csv)",
-                type=["csv"],
-                key=f"archivo_fuente_{sufijo}",
-            )
-            if seleccion == opcion_nueva:
-                nombre = st.text_input("Nombre público de la fuente", key=f"nombre_fuente_{sufijo}")
-                procedencia = st.text_input(
-                    "Institución o URL de procedencia", key=f"procedencia_{sufijo}"
-                )
-                licencia = st.text_input(
-                    "Licencia de uso", key=f"licencia_{sufijo}", placeholder="CC BY 4.0, uso público…"
-                )
-                fecha_disponible = st.text_input(
-                    "Fecha de publicación o actualización", key=f"fecha_{sufijo}"
-                )
-                version = st.text_input(
-                    "Versión del conjunto", key=f"version_{sufijo}", placeholder="2026, v1…"
-                )
-                metadatos_fuente = {
-                    "nombre": nombre.strip(),
-                    "procedencia": procedencia.strip(),
-                    "licencia": licencia.strip(),
-                    "fecha_disponible": fecha_disponible.strip(),
-                    "version": version.strip(),
-                }
-            else:
-                metadatos_guardados = catalogo_por_nombre[seleccion]
-                metadatos_fuente = {
-                    "nombre": metadatos_guardados["nombre"],
-                    "procedencia": metadatos_guardados["procedencia"],
-                    "licencia": metadatos_guardados["licencia"],
-                    "fecha_disponible": _fecha_texto(metadatos_guardados["fecha_disponible"]),
-                    "version": metadatos_guardados["version"],
-                }
-                st.info(
-                    f"**Procedencia:** {metadatos_fuente['procedencia']}\n\n"
-                    f"**Licencia:** {metadatos_fuente['licencia']} · "
-                    f"**Versión:** {metadatos_fuente['version']}"
-                )
-
+carga, catalogos, datos, cruce, monitoreo, api_tab = st.tabs(
+    ["⬆️ Integrar fuentes", "📚 Catálogo", "🗂️ Datos", "📊 Cruce territorial", "🛰️ Monitoreo", "🔌 API"])
+with carga:
+    st.subheader("Integrar dos indicadores por territorio y año")
+    st.info("CSV agregado: codigo_dpa, territorio, provincia, anio, valor. "
+            "CSV de registros: reemplaza valor por ruc (se cuentan RUC distintos por DPA/año). "
+            "Para parroquias incluye canton; para provincias no se exige provincia. "
+            "Mantén DPA y RUC como texto, con sus ceros iniciales.")
+    st.caption("Los nombres territoriales provienen de tus archivos; no se valida contra un catálogo oficial externo.")
+    with st.expander("Descargar ejemplos sintéticos para probar"):
+        for name in ("poblacion_demo.csv", "ruc_demo.csv"):
+            path = Path(__file__).parent / "ejemplos" / name
+            st.download_button(name, path.read_bytes(), file_name=name, mime="text/csv")
+        st.write("Metadatos sugeridos: Demo INEC / demo_poblacion / personas; "
+                 "Demo SRI / demo_ruc / contribuyentes. Fecha: 2026-11-26. Son datos ficticios.")
+    fuentes, errores = [], []
+    opciones = {f["nombre"]: f for f in catalogo}
+    for idx, column in enumerate(st.columns(2)):
+        with column:
+            st.markdown(f"#### Fuente {idx + 1}")
+            seleccion = st.selectbox("Fuente", ["Nueva fuente", *opciones], key=f"fuente_{idx}")
+            existente = opciones.get(seleccion, {})
+            nombre = st.text_input("Nombre", value=existente.get("nombre", ""), key=f"nombre_{idx}_{seleccion}")
+            publicador = st.text_input("Publicador", value=existente.get("publicador", ""), key=f"publicador_{idx}_{seleccion}")
+            url = st.text_input("URL o procedencia", value=existente.get("url_descarga", ""), key=f"url_{idx}_{seleccion}")
+            licencia = st.text_input("Licencia", value=existente.get("licencia", ""), key=f"licencia_{idx}_{seleccion}")
+            fecha = st.date_input("Fecha de actualización de la fuente", key=f"fecha_{idx}")
+            estructura = st.selectbox("Estructura", ["agregada", "registro"],
+                index=1 if existente.get("estructura") == "registro" else 0, key=f"estructura_{idx}_{seleccion}")
+            codigo = st.text_input("Código único del indicador", key=f"indicador_{idx}",
+                help="Ejemplo: inec_poblacion o sri_contribuyentes. No reutilices un código de otra fuente.")
+            indicador_nombre = st.text_input("Nombre del indicador", key=f"indicador_nombre_{idx}")
+            unidad = st.text_input("Unidad", key=f"unidad_{idx}",
+                help="En estructura registro, el valor es el número de RUC distintos, no establecimientos.")
+            archivo = st.file_uploader("Archivo CSV", type=["csv"], key=f"archivo_fuente_{idx}")
+            renombres = st.text_area("Renombrar columnas (JSON)", value="{}", key=f"renombres_{idx}",
+                help='Ejemplo: {"dpa_canton": "codigo_dpa", "poblacion": "valor", "nombre_canton": "territorio"}')
+            try:
+                mapa = json.loads(renombres)
+                if not isinstance(mapa, dict):
+                    raise ValueError("El mapa debe ser un objeto JSON")
+            except (ValueError, json.JSONDecodeError):
+                errores.append(f"Fuente {idx + 1}: revisa el mapa de columnas")
+                mapa = {}
+            meta = dict(nombre=nombre, publicador=publicador, url_descarga=url, licencia=licencia,
+                fecha_actualizacion=fecha.isoformat(), estructura=estructura,
+                indicador_codigo=codigo, indicador_nombre=indicador_nombre, unidad=unidad)
             if archivo is not None:
-                st.caption(f"Seleccionado: **{archivo.name}** · {archivo.size / 1024:,.1f} KB")
-            fuentes_seleccionadas.append(
-                {
-                    "archivo": archivo,
-                    "metadatos": metadatos_fuente,
-                    "nombre_archivo": archivo.name if archivo else "",
-                }
-            )
-
-    st.markdown("---")
-    st.markdown("#### Reglas de transformación y validación")
-    with st.expander("Configura cómo se armonizan los datos", expanded=False):
-        st.caption(
-            "Los nombres se normalizan automáticamente. Usa los campos siguientes "
-            "para alinear nombres o convertir tipos antes de comparar."
-        )
-        st.selectbox(
-            "Perfil de reglas preconfigurado",
-            [
-                "Estándar: normalizar y quitar duplicados",
-                "Completo: quitar nulos y duplicados",
-                "Conservar todas las filas",
-                "Personalizado",
-            ],
-            key="perfil_reglas",
-            help="Selecciona una política habitual o usa Personalizado para controlar las reglas manualmente.",
-        )
-        col_regla_a, col_regla_b = st.columns(2)
-        with col_regla_a:
-            st.text_area(
-                "Renombrar columnas (JSON)",
-                value="{}",
-                key="reglas_renombres",
-                help='Ejemplo: {"codigo_postal": "codigo"}',
-            )
-            st.text_input(
-                "Columnas requeridas (separadas por coma)",
-                key="reglas_requeridas",
-                placeholder="provincia, anio",
-            )
-        with col_regla_b:
-            st.text_area(
-                "Convertir tipos (JSON)",
-                value="{}",
-                key="reglas_tipos",
-                help='Ejemplo: {"poblacion": "int", "indice": "float", "fecha": "date"}',
-            )
-            st.checkbox(
-                "Eliminar filas con valores vacíos (personalizado)",
-                key="reglas_eliminar_nulos",
-            )
-            st.checkbox(
-                "Eliminar filas duplicadas (personalizado)",
-                value=True,
-                key="reglas_eliminar_duplicados",
-            )
-
-    reglas: dict[str, Any] | None = None
-    error_reglas: str | None = None
-    try:
-        reglas = _leer_reglas()
-    except (json.JSONDecodeError, ValueError) as error:
-        error_reglas = str(error)
-        st.error(f"Revisa la configuración de reglas: {error}")
-
-    metadatos_incompletos = [
-        (indice + 1, _validar_metadatos(fuente["metadatos"]))
-        for indice, fuente in enumerate(fuentes_seleccionadas)
-    ]
-    errores_metadatos = [
-        f"Fuente {indice}: faltan " + ", ".join(campos)
-        for indice, campos in metadatos_incompletos
-        if campos
-    ]
-    if errores_metadatos:
-        st.warning("Completa la procedencia, licencia, fecha y versión de ambas fuentes.")
-
-    comparacion: dict[str, Any] | None = None
-    error_comparacion: str | None = None
-    if all(fuente["archivo"] for fuente in fuentes_seleccionadas) and reglas is not None:
-        motor_revision = PipelineETL(
-            reglas_transformacion=reglas,
-            conexion_db=persistencia.db,
-        )
+                fuentes.append(dict(nombre=nombre, archivo=archivo.name, contenido=archivo.getvalue(),
+                                    metadatos=meta, reglas={"renombrar_columnas": mapa}))
+    for error in errores:
+        st.error(error)
+    if st.button("Validar compatibilidad", disabled=len(fuentes) != 2 or bool(errores)):
+        motor = PipelineETL(conexion_db=persistencia.db)
         try:
-            comparacion = motor_revision.comparar_fuentes_csv(
-                fuentes_seleccionadas[0]["archivo"].getvalue(),
-                fuentes_seleccionadas[0]["nombre_archivo"],
-                fuentes_seleccionadas[1]["archivo"].getvalue(),
-                fuentes_seleccionadas[1]["nombre_archivo"],
-            )
-        except (ValueError, TypeError, UnicodeError) as error:
-            error_comparacion = str(error)
+            resultado = motor.previsualizar(fuentes)
+            st.success(f"Compatibles: {resultado['coincidencias_dpa_anio']} coincidencias por DPA y año.")
+            st.json(resultado)
+        except (ValueError, KeyError, TypeError) as exc:
+            st.error(str(exc))
         finally:
-            motor_revision.persistencia.engine.dispose()
-
-    if comparacion and comparacion["compatible"]:
-        st.success(
-            "Esquemas compatibles. "
-            f"{len(comparacion['columnas_comunes'])} columnas armonizadas: "
-            + ", ".join(comparacion["columnas_comunes"])
-        )
-    elif comparacion:
-        st.error("Las fuentes no son compatibles todavía. Revisa los nombres y las reglas.")
-        if comparacion["solo_fuente_a"]:
-            st.write("Solo en Fuente 01:", ", ".join(comparacion["solo_fuente_a"]))
-        if comparacion["solo_fuente_b"]:
-            st.write("Solo en Fuente 02:", ", ".join(comparacion["solo_fuente_b"]))
-    elif error_comparacion:
-        st.error(f"No se pudo comparar el contenido: {error_comparacion}")
-    else:
-        st.info("Selecciona dos archivos y completa sus metadatos para verificar compatibilidad.")
-
-    botones_flujo = st.columns([1, 1, 2])
-    puede_guardar = not errores_metadatos and reglas is not None
-    if botones_flujo[0].button(
-        "Guardar en catálogo",
-        disabled=not puede_guardar,
-        use_container_width=True,
-    ):
-        for fuente in fuentes_seleccionadas:
-            persistencia.registrar_fuente(
-                {
-                    **fuente["metadatos"],
-                    "formato": "CSV",
-                    "fecha_registro": datetime.now(timezone.utc),
-                    "columnas": [],
-                    "filas_disponibles": 0,
-                }
-            )
-        st.session_state["fuentes_guardadas"] = True
-        st.rerun()
-
-    puede_integrar = (
-        not errores_metadatos
-        and reglas is not None
-        and comparacion is not None
-        and comparacion["compatible"]
-    )
-    if botones_flujo[1].button(
-        "Integrar las dos fuentes",
-        type="primary",
-        disabled=not puede_integrar,
-        use_container_width=True,
-    ):
-        motor_etl = PipelineETL(
-            reglas_transformacion=reglas,
-            conexion_db=persistencia.db,
-        )
+            motor.persistencia.engine.dispose()
+    if st.button("Integrar las dos fuentes", type="primary", disabled=len(fuentes) != 2 or bool(errores)):
+        motor = PipelineETL(conexion_db=persistencia.db)
         try:
-            with st.spinner("Validando y procesando ambas fuentes…"):
-                resultado = motor_etl.ejecutar_dos_fuentes_csv(
-                    [
-                        {
-                            "contenido": fuente["archivo"].getvalue(),
-                            "archivo": fuente["nombre_archivo"],
-                            "nombre": fuente["metadatos"]["nombre"],
-                            "metadatos": fuente["metadatos"],
-                        }
-                        for fuente in fuentes_seleccionadas
-                    ]
-                )
-            st.session_state["ultima_integracion"] = resultado
+            with st.spinner("Validando y guardando ambas fuentes…"):
+                st.session_state["resultado_relacional"] = motor.ejecutar_dos_fuentes_csv(fuentes)
             st.rerun()
-        except Exception as error:
-            st.error(f"La integración falló y quedó registrada en el monitoreo: {error}")
+        except (ValueError, KeyError, TypeError, SQLAlchemyError) as exc:
+            st.error(f"No se cargaron datos parciales. Consulta Monitoreo. Detalle: {exc}")
         finally:
-            motor_etl.persistencia.engine.dispose()
+            motor.persistencia.engine.dispose()
 
-with tab_catalogo:
-    st.subheader("Catálogo de fuentes públicas")
-    st.caption("Consulta procedencia, licencia, formato, actualización y esquema conocido.")
-    if catalogo:
-        catalogo_df = pd.DataFrame(catalogo)
-        columnas_catalogo = [
-            "nombre",
-            "procedencia",
-            "licencia",
-            "formato",
-            "fecha_disponible",
-            "version",
-            "columnas",
-            "filas_disponibles",
-        ]
-        columnas_catalogo = [col for col in columnas_catalogo if col in catalogo_df]
-        st.dataframe(
-            catalogo_df[columnas_catalogo],
-            width="stretch",
-            hide_index=True,
-        )
-        nombres_disponibles = [fuente["nombre"] for fuente in catalogo]
-        fuente_detalle = st.selectbox(
-            "Revisar ficha de fuente",
-            nombres_disponibles,
-            key="detalle_catalogo",
-        )
-        ficha = next(fuente for fuente in catalogo if fuente["nombre"] == fuente_detalle)
-        with st.container(border=True):
-            detalle_a, detalle_b = st.columns(2)
-            detalle_a.markdown(f"**Procedencia**  \n{ficha['procedencia']}")
-            detalle_a.markdown(f"**Licencia**  \n{ficha['licencia']}")
-            detalle_b.markdown(f"**Formato / versión**  \n{ficha['formato']} · {ficha['version']}")
-            detalle_b.markdown(
-                f"**Disponibilidad**  \n{ficha['fecha_disponible']} · "
-                f"{ficha['filas_disponibles']:,} filas registradas"
-            )
-    else:
-        st.info("El catálogo está vacío. Registra tus primeras fuentes desde «Integrar fuentes».")
+with catalogos:
+    st.subheader("Fuentes")
+    st.dataframe(pd.DataFrame(catalogo), width="stretch")
+    st.subheader("Versiones de archivos")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.version_fuente)), width="stretch")
+    st.subheader("Indicadores")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.indicador)), width="stretch")
+    st.subheader("Territorios y jerarquía")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.territorio)), width="stretch")
 
-with tab_datos:
-    st.subheader("Datos integrados")
-    if df_registros.empty:
-        st.info("Todavía no hay registros almacenados.")
-    else:
-        assert columna_fuente is not None
-        fuentes_registros = sorted(df_registros[columna_fuente].dropna().unique().tolist())
-        filtro_fuente = st.selectbox("Fuente", ["Todas", *fuentes_registros], key="filtro_fuente")
-        df_visibles = df_registros
-        if filtro_fuente != "Todas":
-            df_visibles = df_registros[df_registros[columna_fuente] == filtro_fuente]
-        columnas_datos = [
-            columna for columna in df_visibles.columns if columna != columna_fuente
-        ]
-        consulta = st.text_input("Buscar en los registros", placeholder="Escribe un valor para filtrar…")
-        if consulta:
-            coincide = df_visibles[columnas_datos].astype(str).apply(
-                lambda columna: columna.str.contains(consulta, case=False, na=False)
-            ).any(axis=1)
-            df_visibles = df_visibles[coincide]
-        columnas_mostrar = st.multiselect(
-            "Campos visibles",
-            columnas_datos,
-            default=columnas_datos,
-        )
-        etiqueta_fuente = _columna_disponible("Fuente de procedencia", columnas_mostrar)
-        tabla = df_visibles[[columna_fuente, *columnas_mostrar]].rename(
-            columns={columna_fuente: etiqueta_fuente}
-        )
-        st.dataframe(tabla, width="stretch", hide_index=True)
-        st.download_button(
-            "Descargar resultado como CSV",
-            data=tabla.to_csv(index=False).encode("utf-8-sig"),
-            file_name="datos_abiertos.csv",
-            mime="text/csv",
-        )
-        st.caption(f"{len(df_visibles):,} filas en el resultado · máximo 10 000 registros recientes.")
+with datos:
+    st.subheader("Observaciones")
+    filtro_fuente = st.selectbox("Filtrar fuente", ["Todas", *opciones], key="datos_fuente")
+    filtro_dpa = st.text_input("Código DPA (opcional)", key="datos_dpa")
+    observaciones = persistencia.obtener_observaciones(
+        origen=None if filtro_fuente == "Todas" else filtro_fuente, codigo_dpa=filtro_dpa or None)
+    df = pd.DataFrame(observaciones)
+    st.caption("Se muestran hasta 10 000 observaciones, incluidas versiones históricas.")
+    st.dataframe(df, width="stretch")
+    st.download_button("Descargar observaciones CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="observaciones.csv", mime="text/csv")
 
-with tab_analisis:
-    st.subheader("Explora los indicadores")
-    if df_registros.empty:
-        st.info("Importa fuentes compatibles para habilitar las visualizaciones.")
-    else:
-        assert columna_fuente is not None
-        columnas_datos = [
-            columna for columna in df_registros.columns if columna != columna_fuente
-        ]
-        numericas = _columnas_numericas(df_registros, columnas_datos)
-        categoricas = [
-            columna for columna in columnas_datos
-            if 1 < df_registros[columna].nunique(dropna=True) <= 100
-        ]
-        fechas = _columnas_fecha(df_registros, columnas_datos)
-        tipo_grafica = st.radio(
-            "Vista",
-            ["Indicador", "Distribución", "Comparar categorías", "Evolución temporal"],
-            horizontal=True,
-            key="tipo_analisis",
-        )
-        if tipo_grafica == "Indicador" and numericas:
-            columna = st.selectbox("Indicador", numericas, key="indicador_principal")
-            valores = pd.to_numeric(df_registros[columna], errors="coerce").dropna()
-            met_a, met_b, met_c = st.columns(3)
-            met_a.metric("Promedio", f"{valores.mean():,.2f}")
-            met_b.metric("Máximo registrado", f"{valores.max():,.2f}")
-            met_c.metric("Observaciones válidas", f"{len(valores):,}")
-            st.bar_chart(valores.reset_index(drop=True), color="#17624d")
-        elif tipo_grafica == "Distribución" and numericas:
-            columna = st.selectbox("Campo numérico", numericas, key="campo_distribucion")
-            valores = pd.to_numeric(df_registros[columna], errors="coerce").dropna()
-            if not valores.empty:
-                bins = min(20, max(1, valores.nunique()))
-                frecuencias = pd.cut(valores, bins=bins, duplicates="drop").value_counts().sort_index()
-                frecuencias.index = frecuencias.index.astype(str)
-                st.bar_chart(frecuencias, color="#17624d")
-        elif tipo_grafica == "Comparar categorías" and categoricas:
-            columna = st.selectbox("Agrupar por", categoricas, key="campo_categoria")
-            resumen = (
-                df_registros[columna].fillna("(sin dato)").astype(str)
-                .value_counts().head(20)
-            )
-            st.bar_chart(resumen, color="#d39a2c")
-            st.caption("Se muestran hasta 20 categorías por número de registros.")
-        elif tipo_grafica == "Evolución temporal" and fechas and numericas:
-            col_fecha, col_valor = st.columns(2)
-            fecha = col_fecha.selectbox("Fecha", fechas, key="campo_fecha")
-            valor = col_valor.selectbox("Indicador", numericas, key="campo_temporal")
-            serie = pd.DataFrame(
-                {
-                    "fecha": pd.to_datetime(df_registros[fecha], errors="coerce"),
-                    "valor": pd.to_numeric(df_registros[valor], errors="coerce"),
-                }
-            ).dropna()
-            if not serie.empty:
-                mensual = serie.set_index("fecha")["valor"].resample("ME").mean().dropna()
-                st.line_chart(mensual, color="#17624d")
+with cruce:
+    st.subheader("Cruzar indicadores por DPA y año")
+    st.caption("Usa la última versión disponible por indicador, territorio y año, según fecha de publicación. "
+               "Solo muestra territorios presentes en ambos indicadores.")
+    codigos = [i["codigo"] for i in persistencia.listar(m.indicador)]
+    if len(codigos) >= 2:
+        a = st.selectbox("Indicador A", codigos, key="cruce_a")
+        b = st.selectbox("Indicador B", codigos, index=1, key="cruce_b")
+        anio = st.number_input("Año", min_value=1900, max_value=2100, value=2026, step=1)
+        if a == b:
+            st.warning("Selecciona indicadores diferentes")
         else:
-            st.info("No hay suficientes columnas compatibles para construir esta visualización.")
-
-with tab_monitoreo:
-    st.subheader("Trazabilidad del procesamiento")
-    if df_ejecuciones.empty:
-        st.info("Las ejecuciones ETL aparecerán aquí con su estado y métricas de calidad.")
+            cruzados = pd.DataFrame(persistencia.cruzar_indicadores(a, b, int(anio)))
+            st.dataframe(cruzados, width="stretch")
+            if not cruzados.empty:
+                grafica = cruzados.set_index("codigo_dpa")[["valor_a", "valor_b"]].astype(float)
+                st.bar_chart(grafica)
+                st.caption(f"valor_a = {a}; valor_b = {b}. Revisa las unidades antes de comparar magnitudes.")
     else:
-        ultima = ejecuciones[0]
-        estado = str(ultima.get("estado", "desconocido")).upper()
-        col_estado, col_filas, col_duracion, col_fuentes = st.columns(4)
-        col_estado.metric("Último estado", estado)
-        col_filas.metric("Filas procesadas", f"{ultima.get('filas_procesadas', 0):,}")
-        col_duracion.metric("Duración", f"{ultima.get('duracion_segundos', 0):.2f} s")
-        col_fuentes.metric("Fuentes", str(ultima.get("origen") or "—"))
+        st.info("Carga dos indicadores para habilitar el cruce.")
 
-        indicadores = ultima.get("indicadores_calidad") or {}
-        if isinstance(indicadores, str):
-            indicadores = _json_value(indicadores)
-        if indicadores:
-            st.markdown("#### Indicadores de calidad")
-            st.json(indicadores, expanded=True)
-        errores = ultima.get("errores") or []
-        if isinstance(errores, str):
-            errores = _json_value(errores)
-        if errores:
-            st.error("La ejecución más reciente registró errores.")
-            for error in errores:
-                st.write(f"- {error}")
-        else:
-            st.success("La última ejecución finalizó sin errores.")
+with monitoreo:
+    st.subheader("Ejecuciones")
+    st.dataframe(pd.DataFrame(persistencia.obtener_ejecuciones()), width="stretch")
+    st.subheader("Errores")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.error_ejecucion)), width="stretch")
+    st.subheader("Métricas por ejecución y versión")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.metrica_calidad)), width="stretch")
+    st.subheader("Reglas registradas")
+    st.dataframe(pd.DataFrame(persistencia.listar(m.regla)), width="stretch")
 
-        historial = df_ejecuciones.copy()
-        for columna in ("indicadores_calidad", "errores"):
-            if columna in historial:
-                historial[columna] = historial[columna].map(
-                    lambda valor: json.dumps(_json_value(valor), ensure_ascii=False, default=str)
-                )
-        columnas_historial = [
-            columna for columna in (
-                "id", "inicio", "estado", "origen", "duracion_segundos",
-                "filas_procesadas", "indicadores_calidad", "errores",
-            ) if columna in historial
-        ]
-        st.markdown("#### Historial de ejecuciones")
-        st.dataframe(historial[columnas_historial], width="stretch", hide_index=True)
-
-with tab_api:
-    st.subheader("API REST de consulta")
-    st.caption("Accede a las fuentes, registros y ejecuciones desde otras herramientas.")
-    st.code(
-        "GET http://127.0.0.1:8000/api/v1/fuentes\n"
-        "GET http://127.0.0.1:8000/api/v1/registros?limite=1000\n"
-        "GET http://127.0.0.1:8000/api/v1/registros?origen=FUENTE&limite=1000\n"
-        "GET http://127.0.0.1:8000/api/v1/ejecuciones?limite=100\n"
-        "GET http://127.0.0.1:8000/health",
-        language="http",
-    )
-    st.link_button("Abrir documentación interactiva Swagger", "http://127.0.0.1:8000/docs")
-    st.info(
-        "Inicia la API en otra terminal con: "
-        "`.venv\\Scripts\\python.exe -m uvicorn api:app --reload --port 8000`"
-    )
-    st.caption("La API y el tablero utilizan la misma variable `DATABASE_URL`.")
-
-st.markdown(
-    '<div class="portal-footer">Observatorio de datos abiertos · Información pública para una gestión basada en evidencia</div>',
-    unsafe_allow_html=True,
-)
+with api_tab:
+    st.code("GET /api/v1/fuentes\nGET /api/v1/observaciones?codigo_dpa=1101&anio=2026\n"
+            "GET /api/v1/cruce?indicador_a=demo_poblacion&indicador_b=demo_ruc&anio=2026\n"
+            "GET /api/v1/ejecuciones\nGET /api/v1/errores\nGET /api/v1/metricas")
+    st.link_button("Abrir documentación de la API", "http://127.0.0.1:8000/docs")
